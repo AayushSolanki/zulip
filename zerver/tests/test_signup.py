@@ -843,10 +843,23 @@ class LoginTest(ZulipTestCase):
         reset_emails_in_zulip_realm()
 
         realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
         stream_names = [f"stream_{i}" for i in range(40)]
         for stream_name in stream_names:
             stream = self.make_stream(stream_name, realm=realm)
             DefaultStream.objects.create(stream=stream, realm=realm)
+
+        # Make sure there's at least one recent message to be mark
+        # unread.  This prevents a bug where this test would start
+        # failing the test database was generated more than
+        # ONBOARDING_RECENT_TIMEDELTA ago.
+        self.subscribe(hamlet, "stream_0")
+        self.send_stream_message(
+            hamlet,
+            "stream_0",
+            topic_name="test topic",
+            content="test message",
+        )
 
         # Clear all the caches.
         flush_per_request_caches()
@@ -855,7 +868,7 @@ class LoginTest(ZulipTestCase):
         with queries_captured() as queries, cache_tries_captured() as cache_tries:
             self.register(self.nonreg_email("test"), "test")
         # Ensure the number of queries we make is not O(streams)
-        self.assert_length(queries, 89)
+        self.assert_length(queries, 90)
 
         # We can probably avoid a couple cache hits here, but there doesn't
         # seem to be any O(N) behavior.  Some of the cache hits are related
@@ -1266,6 +1279,31 @@ class InviteUserTest(InviteUserBase):
         self.assertEqual(
             prereg_user.referred_by.email,
             inviter.email,
+        )
+
+    def test_invite_from_now_deactivated_user(self) -> None:
+        """
+        While accepting an invitation from a user,
+        processing for a new user account will only
+        be completed if the inviter is not deactivated
+        after sending the invite.
+        """
+        inviter = self.example_user("hamlet")
+        self.login_user(inviter)
+        invitee = self.nonreg_email("alice")
+
+        result = self.invite(invitee, ["Denmark"])
+        self.assert_json_success(result)
+
+        prereg_user = PreregistrationUser.objects.get(email=invitee)
+        change_user_is_active(inviter, False)
+        do_create_user(
+            invitee,
+            "password",
+            inviter.realm,
+            "full name",
+            prereg_user=prereg_user,
+            acting_user=None,
         )
 
     def test_successful_invite_user_as_owner_from_owner_account(self) -> None:
@@ -5114,7 +5152,7 @@ class UserSignUpTest(InviteUserBase):
             LDAP_APPEND_DOMAIN="zulip.com",
             AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
             AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
-            TERMS_OF_SERVICE=False,
+            TERMS_OF_SERVICE_VERSION=1.0,
         ):
             result = self.client_get(confirmation_url)
             self.assertEqual(result.status_code, 200)
@@ -5246,7 +5284,7 @@ class UserSignUpTest(InviteUserBase):
             "AssertionError: Mirror dummy user is already active!" in error_log.output[0]
         )
 
-    @override_settings(TERMS_OF_SERVICE=False)
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
     def test_dev_user_registration(self) -> None:
         """Verify that /devtools/register_user creates a new user, logs them
         in, and redirects to the logged-in app."""
@@ -5262,7 +5300,7 @@ class UserSignUpTest(InviteUserBase):
         self.assertEqual(result["Location"], "http://zulip.testserver/")
         self.assert_logged_in_user_id(user_profile.id)
 
-    @override_settings(TERMS_OF_SERVICE=False)
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
     def test_dev_user_registration_create_realm(self) -> None:
         count = UserProfile.objects.count()
         string_id = f"realm-{count}"
@@ -5280,7 +5318,7 @@ class UserSignUpTest(InviteUserBase):
         assert user_profile is not None
         self.assert_logged_in_user_id(user_profile.id)
 
-    @override_settings(TERMS_OF_SERVICE=False)
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
     def test_dev_user_registration_create_demo_realm(self) -> None:
         result = self.client_post("/devtools/register_demo_realm/")
         self.assertEqual(result.status_code, 302)

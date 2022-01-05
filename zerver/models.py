@@ -37,6 +37,7 @@ from django.utils.timezone import now as timezone_now
 from django.utils.translation import gettext as _
 from django.utils.translation import gettext_lazy
 from django_cte import CTEManager
+from typing_extensions import TypedDict
 
 from confirmation import settings as confirmation_settings
 from zerver.lib import cache
@@ -98,6 +99,15 @@ MAX_TOPIC_NAME_LENGTH = 60
 MAX_LANGUAGE_ID_LENGTH: int = 50
 
 STREAM_NAMES = TypeVar("STREAM_NAMES", Sequence[str], AbstractSet[str])
+
+
+class EmojiInfo(TypedDict):
+    id: str
+    name: str
+    source_url: str
+    deactivated: bool
+    author_id: Optional[int]
+    still_url: Optional[str]
 
 
 def query_for_ids(query: QuerySet, user_ids: List[int], field: str) -> QuerySet:
@@ -726,11 +736,11 @@ class Realm(models.Model):
         return f"<Realm: {self.string_id} {self.id}>"
 
     @cache_with_key(get_realm_emoji_cache_key, timeout=3600 * 24 * 7)
-    def get_emoji(self) -> Dict[str, Dict[str, Any]]:
+    def get_emoji(self) -> Dict[str, EmojiInfo]:
         return get_realm_emoji_uncached(self)
 
     @cache_with_key(get_active_realm_emoji_cache_key, timeout=3600 * 24 * 7)
-    def get_active_emoji(self) -> Dict[str, Dict[str, Any]]:
+    def get_active_emoji(self) -> Dict[str, EmojiInfo]:
         return get_active_realm_emoji_uncached(self)
 
     def get_admin_users_and_bots(
@@ -1048,10 +1058,17 @@ class RealmEmoji(models.Model):
     def __str__(self) -> str:
         return f"<RealmEmoji({self.realm.string_id}): {self.id} {self.name} {self.deactivated} {self.file_name}>"
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["realm", "name"],
+                condition=Q(deactivated=False),
+                name="unique_realm_emoji_when_false_deactivated",
+            ),
+        ]
 
-def get_realm_emoji_dicts(
-    realm: Realm, only_active_emojis: bool = False
-) -> Dict[str, Dict[str, Any]]:
+
+def get_realm_emoji_dicts(realm: Realm, only_active_emojis: bool = False) -> Dict[str, EmojiInfo]:
     query = RealmEmoji.objects.filter(realm=realm).select_related("author")
     if only_active_emojis:
         query = query.filter(deactivated=False)
@@ -1064,12 +1081,13 @@ def get_realm_emoji_dicts(
             author_id = realm_emoji.author_id
         emoji_url = get_emoji_url(realm_emoji.file_name, realm_emoji.realm_id)
 
-        emoji_dict = dict(
+        emoji_dict: EmojiInfo = dict(
             id=str(realm_emoji.id),
             name=realm_emoji.name,
             source_url=emoji_url,
             deactivated=realm_emoji.deactivated,
             author_id=author_id,
+            still_url=None,
         )
 
         if realm_emoji.is_animated:
@@ -1086,11 +1104,11 @@ def get_realm_emoji_dicts(
     return d
 
 
-def get_realm_emoji_uncached(realm: Realm) -> Dict[str, Dict[str, Any]]:
+def get_realm_emoji_uncached(realm: Realm) -> Dict[str, EmojiInfo]:
     return get_realm_emoji_dicts(realm)
 
 
-def get_active_realm_emoji_uncached(realm: Realm) -> Dict[str, Dict[str, Any]]:
+def get_active_realm_emoji_uncached(realm: Realm) -> Dict[str, EmojiInfo]:
     realm_emojis = get_realm_emoji_dicts(realm, only_active_emojis=True)
     d = {}
     for emoji_id, emoji_dict in realm_emojis.items():
@@ -2449,13 +2467,23 @@ def get_realm_stream(stream_name: str, realm_id: int) -> Stream:
     return Stream.objects.select_related().get(name__iexact=stream_name.strip(), realm_id=realm_id)
 
 
-def get_active_streams(realm: Optional[Realm]) -> QuerySet:
+def get_active_streams(realm: Realm) -> QuerySet:
     # TODO: Change return type to QuerySet[Stream]
     # NOTE: Return value is used as a QuerySet, so cannot currently be Sequence[QuerySet]
     """
     Return all streams (including invite-only streams) that have not been deactivated.
     """
     return Stream.objects.filter(realm=realm, deactivated=False)
+
+
+def get_linkable_streams(realm_id: int) -> QuerySet:
+    """
+    This returns the streams that we are allowed to linkify using
+    something like "#frontend" in our markup. For now the business
+    rule is that you can link any stream in the realm that hasn't
+    been deactivated (similar to how get_active_streams works).
+    """
+    return Stream.objects.filter(realm_id=realm_id, deactivated=False)
 
 
 def get_stream(stream_name: str, realm: Realm) -> Stream:
@@ -2820,8 +2848,15 @@ class AbstractEmoji(models.Model):
         default=UNICODE_EMOJI, choices=REACTION_TYPES, max_length=30
     )
 
-    # A string that uniquely identifies a particular emoji.  The format varies
-    # by type:
+    # A string with the property that (realm, reaction_type,
+    # emoji_code) uniquely determines the emoji glyph.
+    #
+    # We cannot use `emoji_name` for this purpose, since the
+    # name-to-glyph mappings for unicode emoji change with time as we
+    # update our emoji database, and multiple custom emoji can have
+    # the same `emoji_name` in a realm (at most one can have
+    # `deactivated=False`). The format for `emoji_code` varies by
+    # `reaction_type`:
     #
     # * For Unicode emoji, a dash-separated hex encoding of the sequence of
     #   Unicode codepoints that define this emoji in the Unicode
@@ -2829,10 +2864,10 @@ class AbstractEmoji(models.Model):
     #   following data, with "non_qualified" taking precedence when both present:
     #     https://raw.githubusercontent.com/iamcal/emoji-data/master/emoji_pretty.json
     #
-    # * For realm emoji (aka user uploaded custom emoji), the ID
-    #   (in ASCII decimal) of the RealmEmoji object.
+    # * For user uploaded custom emoji (`reaction_type="realm_emoji"`), the stringified ID
+    #   of the RealmEmoji object, computed as `str(realm_emoji.id)`.
     #
-    # * For "Zulip extra emoji" (like :zulip:), the filename of the emoji.
+    # * For "Zulip extra emoji" (like :zulip:), the name of the emoji (e.g. "zulip").
     emoji_code: str = models.TextField()
 
     class Meta:
@@ -2863,7 +2898,10 @@ class Reaction(AbstractReaction):
             "user_profile_id",
             "user_profile__full_name",
         ]
-        return Reaction.objects.filter(message_id__in=needed_ids).values(*fields)
+        # The ordering is important here, as it makes it convenient
+        # for clients to display reactions in order without
+        # client-side sorting code.
+        return Reaction.objects.filter(message_id__in=needed_ids).values(*fields).order_by("id")
 
     def __str__(self) -> str:
         return f"{self.user_profile.email} / {self.message.id} / {self.emoji_name}"
@@ -3820,6 +3858,7 @@ class AbstractRealmAuditLog(models.Model):
     USER_DEACTIVATED = 103
     USER_REACTIVATED = 104
     USER_ROLE_CHANGED = 105
+    USER_DELETED = 106
 
     USER_SOFT_ACTIVATED = 120
     USER_SOFT_DEACTIVATED = 121
@@ -3827,7 +3866,7 @@ class AbstractRealmAuditLog(models.Model):
     USER_AVATAR_SOURCE_CHANGED = 123
     USER_FULL_NAME_CHANGED = 124
     USER_EMAIL_CHANGED = 125
-    USER_TOS_VERSION_CHANGED = 126
+    USER_TERMS_OF_SERVICE_VERSION_CHANGED = 126
     USER_API_KEY_CHANGED = 127
     USER_BOT_OWNER_CHANGED = 128
     USER_DEFAULT_SENDING_STREAM_CHANGED = 129
@@ -3875,6 +3914,15 @@ class AbstractRealmAuditLog(models.Model):
     STREAM_DEACTIVATED = 602
     STREAM_NAME_CHANGED = 603
     STREAM_REACTIVATED = 604
+    STREAM_MESSAGE_RETENTION_DAYS_CHANGED = 605
+
+    # The following values are only for RemoteZulipServerAuditLog
+    # Values should be exactly 10000 greater than the corresponding
+    # value used for the same purpose in RealmAuditLog (e.g.
+    # REALM_DEACTIVATED = 201, and REMOTE_SERVER_DEACTIVATED = 10201).
+    REMOTE_SERVER_CREATED = 10215
+    REMOTE_SERVER_PLAN_TYPE_CHANGED = 10204
+    REMOTE_SERVER_DEACTIVATED = 10201
 
     event_type: int = models.PositiveSmallIntegerField()
 

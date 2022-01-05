@@ -28,8 +28,8 @@ import * as rows from "./rows";
 import * as sent_messages from "./sent_messages";
 import * as server_events from "./server_events";
 import * as stream_data from "./stream_data";
-import * as stream_edit from "./stream_edit";
 import * as stream_settings_ui from "./stream_settings_ui";
+import * as stream_subscribers_ui from "./stream_subscribers_ui";
 import * as sub_store from "./sub_store";
 import * as transmit from "./transmit";
 import * as ui_report from "./ui_report";
@@ -495,7 +495,7 @@ export function initialize() {
 
         const sub = sub_store.get(stream_id);
 
-        stream_edit.invite_user_to_stream([user_id], sub, success, xhr_failure);
+        stream_subscribers_ui.invite_user_to_stream([user_id], sub, success, xhr_failure);
     });
 
     $("#compose_invite_users").on("click", ".compose_invite_close", (event) => {
@@ -615,10 +615,11 @@ export function initialize() {
         }
     });
 
-    let instance = {};
     $("body").on("click", ".time_pick", (e) => {
         e.preventDefault();
         e.stopPropagation();
+
+        $(e.target).toggleClass("has_popover");
 
         let target_textarea;
         let edit_message_id;
@@ -630,13 +631,13 @@ export function initialize() {
             target_textarea = $(compose_click_target).closest("form").find("textarea");
         }
 
-        if (!instance.calendarContainer) {
+        if ($(e.target).hasClass("has_popover")) {
             const on_timestamp_selection = (val) => {
                 const timestr = `<time:${val}> `;
                 compose_ui.insert_syntax_and_focus(timestr, target_textarea);
             };
 
-            instance = composebox_typeahead.show_flatpickr(
+            composebox_typeahead.show_flatpickr(
                 $(compose_click_target)[0],
                 on_timestamp_selection,
                 new Date(),
@@ -645,11 +646,7 @@ export function initialize() {
                     position: "above center",
                 },
             );
-            return;
         }
-
-        instance.close();
-        instance.destroy();
     });
 
     $("#compose").on("click", ".markdown_preview", (e) => {
